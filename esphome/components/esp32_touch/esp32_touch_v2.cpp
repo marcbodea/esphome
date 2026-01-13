@@ -24,35 +24,23 @@ void ESP32TouchComponent::update_touch_state_(ESP32TouchBinarySensor *child, boo
     child->last_state_ = is_touched;
     child->publish_state(is_touched);
     if (is_touched) {
-      // Read floating benchmark for logging
-      uint32_t benchmark = this->read_floating_benchmark_(child->touch_pad_);
-      ESP_LOGV(TAG, "Touch Pad '%s' state: ON (value: %" PRIu32 " > threshold + benchmark: %" PRIu32 ")",
-               child->get_name().c_str(), value, child->threshold_ + benchmark);
+      ESP_LOGV(TAG, "Touch Pad '%s' state: ON (value: %" PRIu32 " > threshold: %" PRIu32 ")", child->get_name().c_str(),
+               value, child->threshold_);
     } else {
       ESP_LOGV(TAG, "Touch Pad '%s' state: OFF", child->get_name().c_str());
     }
   }
 }
 
-// Helper to read floating benchmark value
-uint32_t ESP32TouchComponent::read_floating_benchmark_(touch_pad_t pad) const {
-  uint32_t benchmark = 0;
-  touch_pad_read_benchmark(pad, &benchmark);
-  return benchmark;
-}
-
-// Helper to read touch value and update state for a given child (used for timeout events)
+// Helper to read touch value and update state for a given child
 bool ESP32TouchComponent::check_and_update_touch_state_(ESP32TouchBinarySensor *child) {
   // Read current touch value
   uint32_t value = this->read_touch_value(child->touch_pad_);
-  // Read floating benchmark (continuously updated by hardware)
-  uint32_t benchmark = this->read_floating_benchmark_(child->touch_pad_);
 
-  // ESP32-S2/S3 v2: Touch is detected when value > threshold + benchmark
-  ESP_LOGV(TAG,
-           "Checking touch state for '%s' (T%d): value = %" PRIu32 ", threshold = %" PRIu32 ", benchmark = %" PRIu32,
-           child->get_name().c_str(), child->touch_pad_, value, child->threshold_, benchmark);
-  bool is_touched = value > benchmark + child->threshold_;
+  // Touch is detected when value > threshold
+  ESP_LOGV(TAG, "Checking touch state for '%s' (T%d): value = %" PRIu32 ", threshold = %" PRIu32,
+           child->get_name().c_str(), child->touch_pad_, value, child->threshold_);
+  bool is_touched = value > child->threshold_;
 
   this->update_touch_state_(child, is_touched, value);
   return is_touched;
@@ -277,48 +265,13 @@ void ESP32TouchComponent::dump_config() {
 void ESP32TouchComponent::loop() {
   const uint32_t now = App.get_loop_component_start_time();
 
-  // V2 TOUCH HANDLING:
-  // Due to unreliable INACTIVE interrupts on ESP32-S2/S3, we use a hybrid approach:
-  // 1. Process ACTIVE interrupts when pads are touched
-  // 2. Use timeout-based release detection (like v1)
-  // 3. But smarter than v1: verify actual state before releasing on timeout
-  //    This prevents false releases if we missed interrupts
+  // Pure loop-based touch detection:
+  // Check all pads in the loop by reading raw values and comparing against threshold
 
   // In setup mode, periodically log all pad values
   this->process_setup_mode_logging_(now);
 
-  // Process any queued touch events from interrupts
-  TouchPadEventV2 event;
-  while (xQueueReceive(this->touch_queue_, &event, 0) == pdTRUE) {
-    ESP_LOGD(TAG, "Event received, mask = 0x%" PRIx32 ", pad = %d", event.intr_mask, event.pad);
-    // Handle timeout events
-    if (event.intr_mask & TOUCH_PAD_INTR_MASK_TIMEOUT) {
-      // Resume measurement after timeout
-      touch_pad_timeout_resume();
-      // For timeout events, always check the current state
-    } else if (!(event.intr_mask & TOUCH_PAD_INTR_MASK_ACTIVE)) {
-      // Skip if not an active/timeout event
-      continue;
-    }
-
-    // Find the child for the pad that triggered the interrupt
-    for (auto *child : this->children_) {
-      if (child->touch_pad_ == event.pad) {
-        if (event.intr_mask & TOUCH_PAD_INTR_MASK_TIMEOUT) {
-          // For timeout events, we need to read the value to determine state
-          this->check_and_update_touch_state_(child);
-        } else if (event.intr_mask & TOUCH_PAD_INTR_MASK_ACTIVE) {
-          // We only get ACTIVE interrupts now, releases are detected by timeout
-          // Read the current value
-          uint32_t value = this->read_touch_value(child->touch_pad_);
-          this->update_touch_state_(child, true, value);  // Always touched for ACTIVE interrupts
-        }
-        break;
-      }
-    }
-  }
-
-  // Check for released pads periodically (like v1)
+  // Check all pads periodically
   if (!this->should_check_for_releases_(now)) {
     return;
   }
@@ -328,36 +281,16 @@ void ESP32TouchComponent::loop() {
     // Handle initial state publication after startup
     this->publish_initial_state_if_needed_(child, now);
 
-    if (child->last_state_) {
-      // Pad is currently in touched state - check for release timeout
-      // Using subtraction handles 32-bit rollover correctly
-      uint32_t time_diff = now - child->last_touch_time_;
+    // Check current touch state by reading raw value and comparing against threshold
+    this->check_and_update_touch_state_(child);
 
-      // Check if we haven't seen this pad recently
-      if (time_diff > this->release_timeout_ms_) {
-        // Haven't seen this pad recently - verify actual state
-        // Unlike v1, v2 hardware allows us to read the current state anytime
-        // This makes v2 smarter: we can verify if it's actually released before
-        // declaring a timeout, preventing false releases if interrupts were missed
-        bool still_touched = this->check_and_update_touch_state_(child);
-
-        if (still_touched) {
-          // Still touched! Timer was reset in update_touch_state_
-          ESP_LOGVV(TAG, "Touch Pad '%s' still touched after %" PRIu32 "ms timeout, resetting timer",
-                    child->get_name().c_str(), this->release_timeout_ms_);
-        } else {
-          // Actually released - already handled by check_and_update_touch_state_
-          pads_off++;
-        }
-      }
-    } else {
-      // Pad is already off
+    if (!child->last_state_) {
+      // Pad is off
       pads_off++;
     }
   }
 
-  // Disable the loop when all pads are off and not in setup mode (like v1)
-  // We need to keep checking for timeouts, so only disable when all pads are confirmed off
+  // Disable the loop when all pads are off and not in setup mode
   this->check_and_disable_loop_if_all_released_(pads_off);
 }
 
