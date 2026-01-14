@@ -138,9 +138,21 @@ void ESP32TouchComponent::publish_initial_state_if_needed_(ESP32TouchBinarySenso
 
 void ESP32TouchComponent::check_and_disable_loop_if_all_released_(size_t pads_off) {
   // Disable the loop to save CPU cycles when all pads are off and not in setup mode.
+  //
+  // Design note:
+  // - On ESP32 v1 we rely on interrupts to re-enable the loop on the next touch,
+  //   so it is safe and beneficial to disable the loop when all pads are released.
+  // - On ESP32-S2/S3 v2 we now base detection purely on loop-based polling of raw
+  //   values vs. thresholds (not on hardware thresholds/benchmarks or ACTIVE
+  //   interrupts). Because of that, we must keep the loop running to detect new
+  //   touches reliably and cannot safely disable it.
+#ifdef USE_ESP32_VARIANT_ESP32
   if (pads_off == this->children_.size() && !this->setup_mode_) {
     this->disable_loop();
   }
+#else
+  (void) pads_off;
+#endif
 }
 
 void ESP32TouchComponent::calculate_release_timeout_() {
